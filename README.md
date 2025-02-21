@@ -24,7 +24,7 @@ Easy, fast, and cheap LLM serving for everyone
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
-vLLM is fast with:
+vLLM is fast and efficient with:
 
 - State-of-the-art serving throughput
 - Efficient management of attention key and value memory with **PagedAttention**
