@@ -150,7 +150,9 @@ class RedisClient:
         metrics_key = self.get_model_metrics_key(model_name)
         # Convert all values to strings for Redis
         string_metrics = {k: str(v) for k, v in metrics.items()}
-        self.redis.hset(metrics_key, mapping=string_metrics)
+        # Update each key-value pair individually
+        for key, value in string_metrics.items():
+            self.redis.hset(metrics_key, key, value)
 
     def get_metrics(self, model_name: str) -> Dict[str, Any]:
         """Get metrics for a model.
