@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.llm_engine import LLMEngine
@@ -77,7 +77,7 @@ class AsyncLLMEngine:
 
     async def generate(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, List[str]]],
         sampling_params: SamplingParams,
         request_id: str,
         prompt_token_ids: Optional[List[int]] = None
@@ -115,6 +115,15 @@ class AsyncLLMEngine:
                         f"prompt token ids: {prompt_token_ids}.")
 
         # Add the request into the vLLM engine's waiting queue.
+        # Handle batch prompts - convert to single string if needed
+        if isinstance(prompt, list):
+            # For batch processing, we need to ensure prompt is a single string
+            if len(prompt) == 1:
+                prompt = prompt[0]
+            else:
+                raise ValueError("Batch processing with multiple prompts is not supported by the engine directly. "
+                               "Please use separate requests for each prompt.")
+                
         if self.engine_use_ray:
             await self.engine.add_request.remote(
                 request_id, prompt, sampling_params,

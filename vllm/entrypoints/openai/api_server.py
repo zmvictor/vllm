@@ -123,9 +123,13 @@ async def create_completion(raw_request: Request):
                                      "logit_bias is not currently supported")
 
     model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
-    prompt = request.prompt
     created_time = int(time.time())
+    
+    # Handle both single string and list of string prompts
+    prompts = request.prompt
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    
     try:
         sampling_params = SamplingParams(
             n=request.n,
@@ -144,17 +148,17 @@ async def create_completion(raw_request: Request):
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
 
-    result_generator = engine.generate(prompt, sampling_params,
-                                       request_id)
-
     # Similar to the OpenAI API, when n != best_of, we do not stream the
     # results. In addition, we do not stream the results when use beam search.
     stream = (request.stream and
               (request.best_of is None or request.n == request.best_of) and
               not request.use_beam_search)
-
-    async def abort_request() -> None:
-        await engine.abort(request_id)
+              
+    # Process each prompt and collect results
+    all_request_outputs = []
+    
+    async def abort_request(req_id: str) -> None:
+        await engine.abort(req_id)
 
     def create_stream_response_json(index: int,
                                     text: str,
@@ -177,79 +181,118 @@ async def create_completion(raw_request: Request):
         return response_json
 
     async def completion_stream_generator() -> AsyncGenerator[str, None]:
-        previous_texts = [""] * request.n
-        previous_num_tokens = [0] * request.n
-        async for res in result_generator:
-            res: RequestOutput
-            for output in res.outputs:
-                i = output.index
-                delta_text = output.text[len(previous_texts[i]):]
-                if request.logprobs is not None:
-                    logprobs = create_logprobs(
-                        output.token_ids[previous_num_tokens[i]:],
-                        output.logprobs[previous_num_tokens[i]:],
-                        len(previous_texts[i]))
-                else:
-                    logprobs = None
-                previous_texts[i] = output.text
-                previous_num_tokens[i] = len(output.token_ids)
-                response_json = create_stream_response_json(
-                    index=i,
-                    text=delta_text,
-                    logprobs=logprobs,
-                )
-                yield f"data: {response_json}\n\n"
-                if output.finish_reason is not None:
-                    logprobs = LogProbs() if request.logprobs is not None else None
-                    response_json = create_stream_response_json(
-                        index=i,
-                        text="",
-                        logprobs=logprobs,
-                        finish_reason=output.finish_reason,
-                    )
-                    yield f"data: {response_json}\n\n"
-            yield "data: [DONE]\n\n"
+        # For batch processing with streaming, we process one prompt at a time
+        for i, prompt in enumerate(prompts):
+            # Generate a unique request ID for each prompt
+            request_id = f"cmpl-{random_uuid()}"
+            
+            # Generate completion for this prompt
+            result_generator = engine.generate(prompt, sampling_params, request_id)
+            
+            previous_texts = [""] * request.n
+            previous_num_tokens = [0] * request.n
+            
+            try:
+                async for res in result_generator:
+                    if await raw_request.is_disconnected():
+                        await abort_request(request_id)
+                        return
+                        
+                    res: RequestOutput
+                    for output in res.outputs:
+                        idx = output.index
+                        delta_text = output.text[len(previous_texts[idx]):]
+                        if request.logprobs is not None:
+                            logprobs = create_logprobs(
+                                output.token_ids[previous_num_tokens[idx]:],
+                                output.logprobs[previous_num_tokens[idx]:],
+                                len(previous_texts[idx]))
+                        else:
+                            logprobs = None
+                        previous_texts[idx] = output.text
+                        previous_num_tokens[idx] = len(output.token_ids)
+                        response_json = create_stream_response_json(
+                            index=idx + (i * request.n),  # Adjust index for batch
+                            text=delta_text,
+                            logprobs=logprobs,
+                        )
+                        yield f"data: {response_json}\n\n"
+                        if output.finish_reason is not None:
+                            logprobs = LogProbs() if request.logprobs is not None else None
+                            response_json = create_stream_response_json(
+                                index=idx + (i * request.n),  # Adjust index for batch
+                                text="",
+                                logprobs=logprobs,
+                                finish_reason=output.finish_reason,
+                            )
+                            yield f"data: {response_json}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                logger.error(f"Error in stream processing: {e}")
+                await abort_request(request_id)
+                yield f"data: [ERROR] {str(e)}\n\n"
+                yield "data: [DONE]\n\n"
 
     # Streaming response
     if stream:
         background_tasks = BackgroundTasks()
         # Abort the request if the client disconnects.
-        background_tasks.add_task(abort_request)
+        # We'll handle abort in the stream generator
         return StreamingResponse(completion_stream_generator(),
                                  media_type="text/event-stream",
                                  background=background_tasks)
 
-    # Non-streaming response
-    final_res: RequestOutput = None
-    async for res in result_generator:
-        if await raw_request.is_disconnected():
-            # Abort the request if the client disconnects.
-            await abort_request()
-            return create_error_response(HTTPStatus.BAD_REQUEST,
-                                         "Client disconnected")
-        final_res = res
-    assert final_res is not None
+    # Non-streaming response - process each prompt
+    for i, prompt in enumerate(prompts):
+        # Generate a unique request ID for each prompt
+        request_id = f"cmpl-{random_uuid()}"
+        
+        # Generate completion for this prompt
+        result_generator = engine.generate(prompt, sampling_params, request_id)
+        
+        # Process the results
+        final_res = None
+        async for res in result_generator:
+            if await raw_request.is_disconnected():
+                # Abort the request if the client disconnects
+                await abort_request(request_id)
+                return create_error_response(HTTPStatus.BAD_REQUEST,
+                                           "Client disconnected")
+            final_res = res
+        
+        assert final_res is not None
+        all_request_outputs.append((request_id, final_res))
+    
+    # Combine all results
     choices = []
-    for output in final_res.outputs:
-        if request.logprobs is not None:
-            logprobs = create_logprobs(output.token_ids, output.logprobs)
-        else:
-            logprobs = None
-        choice_data = CompletionResponseChoice(
-            index=output.index,
-            text=output.text,
-            logprobs=logprobs,
-            finish_reason=output.finish_reason,
-        )
-        choices.append(choice_data)
-
-    num_prompt_tokens = len(final_res.prompt_token_ids)
-    num_generated_tokens = sum(len(output.token_ids)
-                               for output in final_res.outputs)
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    
+    for request_id, final_res in all_request_outputs:
+        for output in final_res.outputs:
+            if request.logprobs is not None:
+                logprobs = create_logprobs(output.token_ids, output.logprobs)
+            else:
+                logprobs = None
+            
+            choice_data = CompletionResponseChoice(
+                index=len(choices),  # Reindex to ensure sequential indices
+                text=output.text,
+                logprobs=logprobs,
+                finish_reason=output.finish_reason,
+            )
+            choices.append(choice_data)
+        
+        # Accumulate token counts for usage info
+        total_prompt_tokens += len(final_res.prompt_token_ids)
+        total_completion_tokens += sum(len(output.token_ids)
+                                     for output in final_res.outputs)
+    
+    # Create usage info
     usage = UsageInfo(
-        prompt_tokens=num_prompt_tokens,
-        completion_tokens=num_generated_tokens,
-        total_tokens=num_prompt_tokens + num_generated_tokens,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_prompt_tokens + total_completion_tokens,
     )
     response = CompletionResponse(
         id=request_id,
